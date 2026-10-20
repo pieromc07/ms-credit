@@ -1,0 +1,789 @@
+openapi: 3.0.3
+
+info:
+  title: MS Credit API
+  version: 1.0.0
+  description: >
+    API REST para productos de crédito y tarjetas de crédito.
+    El servicio es dueño del límite, la deuda y el estado de cada producto y tarjeta.
+
+    Reglas de crédito (Parte I):
+    - Cliente personal: como máximo un producto de crédito activo.
+    - Cliente empresarial: puede tener varios productos de crédito activos.
+    - Moneda PEN. Los pagos pueden ser parciales, reducen la deuda y no pueden superarla.
+    - No hay intereses, mora ni amortización.
+    - Deuda vencida: saldo pendiente mayor que cero con fecha de vencimiento anterior a hoy.
+      Un cliente con deuda vencida no puede adquirir productos de crédito ni tarjetas.
+    - El límite de la tarjeta depende del tipo de cliente y se configura en el Config Server.
+    - Los consumos a la tarjeta no pueden superar el crédito disponible.
+    - Una tarjeta con deuda pendiente no puede cancelarse.
+
+    Esta API no consulta otros microservicios. Los consumos y pagos que envía ms-transaction
+    se validan aquí contra el límite y la deuda.
+
+servers:
+  - url: http://localhost:8082
+    description: Entorno local
+
+tags:
+  - name: CreditProducts
+    description: Productos de crédito personales y empresariales
+  - name: CreditCards
+    description: Tarjetas de crédito personales y empresariales
+
+paths:
+  /api/v1/credit-products:
+    post:
+      tags:
+        - CreditProducts
+      summary: Create a credit product
+      description: >
+        Creates a credit product for a customer. The system generates the identifier, the
+        status ACTIVE and the timestamps. The outstanding balance starts equal to the amount.
+        Personal customers may hold only one active credit product. Customers with overdue
+        debt cannot acquire new credit products.
+      operationId: createCreditProduct
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateCreditProductRequest'
+            examples:
+              personalLoan:
+                summary: Personal credit product
+                value:
+                  customerId: 65f1a8b2c4d9e01234567890
+                  customerType: PERSONAL
+                  amount: 3000.00
+                  dueDate: 2026-12-31
+              businessLoan:
+                summary: Business credit product
+                value:
+                  customerId: 65f1a8b2c4d9e01234567891
+                  customerType: BUSINESS
+                  amount: 50000.00
+                  dueDate: 2027-06-30
+      responses:
+        '201':
+          description: Credit product created successfully.
+          headers:
+            Location:
+              description: URI of the created credit product.
+              schema:
+                type: string
+              example: /api/v1/credit-products/65f1a8b2c4d9e01234567892
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CreditProduct'
+
+        '400':
+          description: Invalid JSON, missing required fields or invalid values.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
+              example:
+                status: 400
+                error: BAD_REQUEST
+                message: amount must be greater than 0
+                path: /api/v1/credit-products
+
+        '409':
+          description: >
+            The personal customer already has an active credit product, or the customer
+            has overdue debt.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
+              example:
+                status: 409
+                error: CONFLICT
+                message: Customer has overdue debt
+                path: /api/v1/credit-products
+
+        '415':
+          $ref: '#/components/responses/UnsupportedMediaType'
+
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+    get:
+      tags:
+        - CreditProducts
+      summary: List credit products
+      description: Returns credit products, including paid ones. Supports optional filters.
+      operationId: listCreditProducts
+      parameters:
+        - name: customerId
+          in: query
+          required: false
+          description: Returns only the products of this customer.
+          schema:
+            type: string
+          example: 65f1a8b2c4d9e01234567890
+        - name: status
+          in: query
+          required: false
+          description: Returns only the products with this status.
+          schema:
+            $ref: '#/components/schemas/CreditProductStatus'
+      responses:
+        '200':
+          description: List of credit products.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/CreditProduct'
+
+        '400':
+          description: Invalid query parameter.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
+
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /api/v1/credit-products/{productId}:
+    get:
+      tags:
+        - CreditProducts
+      summary: Get a credit product by identifier
+      operationId: getCreditProductById
+      parameters:
+        - $ref: '#/components/parameters/ProductId'
+      responses:
+        '200':
+          description: Credit product found.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CreditProduct'
+
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /api/v1/credit-products/{productId}/payments:
+    post:
+      tags:
+        - CreditProducts
+      summary: Pay a credit product
+      description: >
+        Applies a partial or total payment to the outstanding balance of a credit product.
+        The payer may be any customer, so third-party payments are allowed. The amount cannot
+        exceed the outstanding balance. When the balance reaches zero the status becomes PAID.
+      operationId: payCreditProduct
+      parameters:
+        - $ref: '#/components/parameters/ProductId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PaymentRequest'
+            examples:
+              partialPayment:
+                summary: Partial payment
+                value:
+                  amount: 500.00
+      responses:
+        '200':
+          description: Payment applied. Returns the updated credit product.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CreditProduct'
+
+        '400':
+          description: Invalid JSON or amount.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
+
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+        '409':
+          description: The credit product is already paid.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
+              example:
+                status: 409
+                error: CONFLICT
+                message: Credit product is already paid
+                path: /api/v1/credit-products/65f1a8b2c4d9e01234567892/payments
+
+        '415':
+          $ref: '#/components/responses/UnsupportedMediaType'
+
+        '422':
+          description: The amount exceeds the outstanding balance.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
+              example:
+                status: 422
+                error: UNPROCESSABLE_ENTITY
+                message: amount exceeds the outstanding balance
+                path: /api/v1/credit-products/65f1a8b2c4d9e01234567892/payments
+
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /api/v1/credit-cards:
+    post:
+      tags:
+        - CreditCards
+      summary: Issue a credit card
+      description: >
+        Issues a credit card for a customer. The credit limit is set from the configuration
+        for the customer type. The card number is generated and only its masked form is returned.
+        Customers with overdue debt cannot acquire credit cards.
+      operationId: createCreditCard
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateCreditCardRequest'
+            examples:
+              personalCard:
+                summary: Personal credit card
+                value:
+                  customerId: 65f1a8b2c4d9e01234567890
+                  customerType: PERSONAL
+      responses:
+        '201':
+          description: Credit card issued successfully.
+          headers:
+            Location:
+              description: URI of the created credit card.
+              schema:
+                type: string
+              example: /api/v1/credit-cards/65f1a8b2c4d9e01234567893
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CreditCard'
+
+        '400':
+          description: Invalid JSON, missing required fields or invalid values.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
+
+        '409':
+          description: The customer has overdue debt.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
+              example:
+                status: 409
+                error: CONFLICT
+                message: Customer has overdue debt
+                path: /api/v1/credit-cards
+
+        '415':
+          $ref: '#/components/responses/UnsupportedMediaType'
+
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+    get:
+      tags:
+        - CreditCards
+      summary: List credit cards
+      description: >
+        Returns the credit cards, including cancelled ones. Returns a plain array so that
+        ms-account can check whether a customer owns a card. Supports optional filters.
+      operationId: listCreditCards
+      parameters:
+        - name: customerId
+          in: query
+          required: false
+          description: Returns only the cards of this customer.
+          schema:
+            type: string
+          example: 65f1a8b2c4d9e01234567890
+        - name: status
+          in: query
+          required: false
+          description: Returns only the cards with this status.
+          schema:
+            $ref: '#/components/schemas/CreditCardStatus'
+      responses:
+        '200':
+          description: List of credit cards.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/CreditCard'
+
+        '400':
+          description: Invalid query parameter.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
+
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /api/v1/credit-cards/{cardId}:
+    get:
+      tags:
+        - CreditCards
+      summary: Get a credit card and its available credit
+      description: Returns the card with its credit limit, consumed amount and available credit.
+      operationId: getCreditCardById
+      parameters:
+        - $ref: '#/components/parameters/CardId'
+      responses:
+        '200':
+          description: Credit card found.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CreditCard'
+
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+    delete:
+      tags:
+        - CreditCards
+      summary: Cancel a credit card
+      description: >
+        Cancels the card logically. The card is kept for history and its status becomes CANCELLED.
+        A card with consumed amount pending payment cannot be cancelled.
+      operationId: cancelCreditCard
+      parameters:
+        - $ref: '#/components/parameters/CardId'
+      responses:
+        '204':
+          description: Credit card cancelled. Calling it again on a cancelled card has no effect.
+
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+        '409':
+          description: The card has consumed amount pending payment.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
+              example:
+                status: 409
+                error: CONFLICT
+                message: Card has pending debt and cannot be cancelled
+                path: /api/v1/credit-cards/65f1a8b2c4d9e01234567893
+
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /api/v1/credit-cards/{cardId}/charges:
+    post:
+      tags:
+        - CreditCards
+      summary: Charge a purchase to a credit card
+      description: >
+        Records a consumption on the card. The amount cannot exceed the available credit.
+        Only active cards accept charges.
+      operationId: chargeCreditCard
+      parameters:
+        - $ref: '#/components/parameters/CardId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CardChargeRequest'
+            examples:
+              purchase:
+                summary: Purchase
+                value:
+                  amount: 150.00
+      responses:
+        '200':
+          description: Charge recorded. Returns the updated card.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CreditCard'
+
+        '400':
+          description: Invalid JSON or amount.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
+
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+        '409':
+          description: The card is cancelled.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
+              example:
+                status: 409
+                error: CONFLICT
+                message: Card is cancelled
+                path: /api/v1/credit-cards/65f1a8b2c4d9e01234567893/charges
+
+        '415':
+          $ref: '#/components/responses/UnsupportedMediaType'
+
+        '422':
+          description: The amount exceeds the available credit.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
+              example:
+                status: 422
+                error: UNPROCESSABLE_ENTITY
+                message: amount exceeds the available credit
+                path: /api/v1/credit-cards/65f1a8b2c4d9e01234567893/charges
+
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /api/v1/credit-cards/{cardId}/payments:
+    post:
+      tags:
+        - CreditCards
+      summary: Pay the consumed amount of a credit card
+      description: >
+        Applies a partial or total payment to the consumed amount of the card, which restores
+        available credit. The amount cannot exceed the consumed amount.
+      operationId: payCreditCard
+      parameters:
+        - $ref: '#/components/parameters/CardId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PaymentRequest'
+            examples:
+              partialPayment:
+                summary: Partial payment
+                value:
+                  amount: 100.00
+      responses:
+        '200':
+          description: Payment applied. Returns the updated card.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CreditCard'
+
+        '400':
+          description: Invalid JSON or amount.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
+
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+        '415':
+          $ref: '#/components/responses/UnsupportedMediaType'
+
+        '422':
+          description: The amount exceeds the consumed amount.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
+              example:
+                status: 422
+                error: UNPROCESSABLE_ENTITY
+                message: amount exceeds the consumed amount
+                path: /api/v1/credit-cards/65f1a8b2c4d9e01234567893/payments
+
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+components:
+  parameters:
+    ProductId:
+      name: productId
+      in: path
+      required: true
+      description: Identifier of the credit product.
+      schema:
+        type: string
+      example: 65f1a8b2c4d9e01234567892
+    CardId:
+      name: cardId
+      in: path
+      required: true
+      description: Identifier of the credit card.
+      schema:
+        type: string
+      example: 65f1a8b2c4d9e01234567893
+
+  schemas:
+    CustomerType:
+      type: string
+      enum:
+        - PERSONAL
+        - BUSINESS
+
+    CreditProductStatus:
+      type: string
+      enum:
+        - ACTIVE
+        - PAID
+
+    CreditCardStatus:
+      type: string
+      enum:
+        - ACTIVE
+        - CANCELLED
+
+    CreateCreditProductRequest:
+      type: object
+      required:
+        - customerId
+        - customerType
+        - amount
+        - dueDate
+      properties:
+        customerId:
+          type: string
+          minLength: 1
+          example: 65f1a8b2c4d9e01234567890
+        customerType:
+          $ref: '#/components/schemas/CustomerType'
+        amount:
+          type: number
+          format: double
+          minimum: 0.01
+          example: 3000.00
+        dueDate:
+          type: string
+          format: date
+          description: Date when the balance is due. Must be today or later at creation.
+          example: 2026-12-31
+
+    CreditProduct:
+      type: object
+      required:
+        - id
+        - customerId
+        - customerType
+        - amount
+        - outstandingBalance
+        - dueDate
+        - status
+        - overdue
+      properties:
+        id:
+          type: string
+          readOnly: true
+          example: 65f1a8b2c4d9e01234567892
+        customerId:
+          type: string
+          example: 65f1a8b2c4d9e01234567890
+        customerType:
+          $ref: '#/components/schemas/CustomerType'
+        amount:
+          type: number
+          format: double
+          description: Amount originally granted.
+          example: 3000.00
+        outstandingBalance:
+          type: number
+          format: double
+          description: Amount still owed.
+          example: 2500.00
+        dueDate:
+          type: string
+          format: date
+          example: 2026-12-31
+        status:
+          $ref: '#/components/schemas/CreditProductStatus'
+        overdue:
+          type: boolean
+          readOnly: true
+          description: True when the status is ACTIVE, the balance is greater than zero and the due date is before today.
+          example: false
+        createdAt:
+          type: string
+          format: date-time
+          readOnly: true
+        updatedAt:
+          type: string
+          format: date-time
+          readOnly: true
+
+    PaymentRequest:
+      type: object
+      required:
+        - amount
+      properties:
+        amount:
+          type: number
+          format: double
+          minimum: 0.01
+          example: 500.00
+
+    CreateCreditCardRequest:
+      type: object
+      required:
+        - customerId
+        - customerType
+      properties:
+        customerId:
+          type: string
+          minLength: 1
+          example: 65f1a8b2c4d9e01234567890
+        customerType:
+          $ref: '#/components/schemas/CustomerType'
+
+    CreditCard:
+      type: object
+      required:
+        - id
+        - customerId
+        - customerType
+        - maskedNumber
+        - creditLimit
+        - consumedAmount
+        - availableCredit
+        - status
+      properties:
+        id:
+          type: string
+          readOnly: true
+          example: 65f1a8b2c4d9e01234567893
+        customerId:
+          type: string
+          example: 65f1a8b2c4d9e01234567890
+        customerType:
+          $ref: '#/components/schemas/CustomerType'
+        maskedNumber:
+          type: string
+          description: Card number with all digits hidden except the last four.
+          example: '**** **** **** 1234'
+        creditLimit:
+          type: number
+          format: double
+          description: Credit limit set from the configuration for the customer type.
+          example: 5000.00
+        consumedAmount:
+          type: number
+          format: double
+          description: Amount consumed and not yet paid.
+          example: 150.00
+        availableCredit:
+          type: number
+          format: double
+          readOnly: true
+          description: Credit limit minus consumed amount.
+          example: 4850.00
+        status:
+          $ref: '#/components/schemas/CreditCardStatus'
+        createdAt:
+          type: string
+          format: date-time
+          readOnly: true
+        updatedAt:
+          type: string
+          format: date-time
+          readOnly: true
+
+    CardChargeRequest:
+      type: object
+      required:
+        - amount
+      properties:
+        amount:
+          type: number
+          format: double
+          minimum: 0.01
+          example: 150.00
+
+    ApiError:
+      type: object
+      required:
+        - status
+        - error
+        - message
+        - path
+      properties:
+        status:
+          type: integer
+          example: 400
+        error:
+          type: string
+          example: BAD_REQUEST
+        message:
+          type: string
+          example: amount must be greater than 0
+        path:
+          type: string
+          example: /api/v1/credit-products
+
+  responses:
+    NotFound:
+      description: The requested resource does not exist.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ApiError'
+          example:
+            status: 404
+            error: NOT_FOUND
+            message: Credit product not found
+            path: /api/v1/credit-products/65f1a8b2c4d9e01234567892
+
+    UnsupportedMediaType:
+      description: Content-Type is not application/json.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ApiError'
+          example:
+            status: 415
+            error: UNSUPPORTED_MEDIA_TYPE
+            message: Content-Type must be application/json
+            path: /api/v1/credit-products
+
+    InternalServerError:
+      description: Unexpected error.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ApiError'
+          example:
+            status: 500
+            error: INTERNAL_SERVER_ERROR
+            message: Unexpected error
+            path: /api/v1/credit-products
