@@ -5,6 +5,9 @@ import static com.nttdata.mscredit.support.Fixtures.card;
 import static com.nttdata.mscredit.support.Fixtures.clock;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyString;
+import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.Mockito.lenient;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
@@ -14,11 +17,14 @@ import java.math.BigDecimal;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
+import org.mockito.ArgumentCaptor;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 import org.springframework.data.domain.Example;
 import org.springframework.http.HttpStatus;
 
+import com.nttdata.mscredit.event.CreditCardEvent;
+import com.nttdata.mscredit.event.CreditEventPublisher;
 import com.nttdata.mscredit.exception.BusinessException;
 import com.nttdata.mscredit.model.CreditCard;
 import com.nttdata.mscredit.model.CreditCardStatus;
@@ -37,11 +43,15 @@ class CreditCardServiceTest {
     private CreditCardRepository repository;
     @Mock
     private OverdueDebtChecker overdueDebtChecker;
+    @Mock
+    private CreditEventPublisher events;
     private CreditCardService service;
 
     @BeforeEach
     void setUp() {
-        service = new CreditCardService(repository, overdueDebtChecker, LIMITS, clock());
+        lenient().when(events.publish(anyString(), any(), any()))
+                .thenReturn(Completable.complete());
+        service = new CreditCardService(repository, overdueDebtChecker, LIMITS, clock(), events);
     }
 
     private void stubSave() {
@@ -209,5 +219,53 @@ class CreditCardServiceTest {
 
         assertBusinessError(service.cancel("card-1").test(), HttpStatus.CONFLICT);
         verify(repository, never()).save(any(CreditCard.class));
+    }
+
+    @Test
+    void issuePublishesCreatedEvent() {
+        when(overdueDebtChecker.ensureNoOverdueDebt("cust-1")).thenReturn(Completable.complete());
+        stubSave();
+
+        service.issue("cust-1", CustomerType.PERSONAL).test().assertNoErrors().assertComplete();
+
+        ArgumentCaptor<Object> payload = ArgumentCaptor.forClass(Object.class);
+        verify(events).publish(eq(CreditCardEvent.TOPIC), any(), payload.capture());
+        CreditCardEvent event = (CreditCardEvent) payload.getValue();
+        assertThat(event.eventType()).isEqualTo(CreditCardEvent.EventType.CREATED);
+        assertThat(event.customerId()).isEqualTo("cust-1");
+    }
+
+    @Test
+    void issueSucceedsWhenEventPublishingFails() {
+        when(overdueDebtChecker.ensureNoOverdueDebt("cust-1")).thenReturn(Completable.complete());
+        stubSave();
+        when(events.publish(anyString(), any(), any()))
+                .thenReturn(Completable.error(new IllegalStateException("kafka down")));
+
+        service.issue("cust-1", CustomerType.PERSONAL).test().assertNoErrors().assertComplete();
+    }
+
+    @Test
+    void cancelPublishesCancelledEventOnTransition() {
+        CreditCard card = card("card-1", "5000.00", "0.00");
+        when(repository.findById("card-1")).thenReturn(Mono.just(card));
+        stubSave();
+
+        service.cancel("card-1").test().assertNoErrors().assertComplete();
+
+        ArgumentCaptor<Object> payload = ArgumentCaptor.forClass(Object.class);
+        verify(events).publish(eq(CreditCardEvent.TOPIC), eq("card-1"), payload.capture());
+        assertThat(((CreditCardEvent) payload.getValue()).eventType())
+                .isEqualTo(CreditCardEvent.EventType.CANCELLED);
+    }
+
+    @Test
+    void cancelDoesNotPublishWhenAlreadyCancelled() {
+        when(repository.findById("card-1")).thenReturn(Mono.just(
+                card("card-1", CustomerType.PERSONAL, "5000.00", "0.00", CreditCardStatus.CANCELLED)));
+
+        service.cancel("card-1").test().assertNoErrors().assertComplete();
+
+        verify(events, never()).publish(anyString(), any(), any());
     }
 }

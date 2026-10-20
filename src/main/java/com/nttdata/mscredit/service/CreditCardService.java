@@ -10,6 +10,8 @@ import org.springframework.http.HttpStatus;
 import org.springframework.stereotype.Service;
 
 import com.nttdata.mscredit.config.CardLimitProperties;
+import com.nttdata.mscredit.event.CreditCardEvent;
+import com.nttdata.mscredit.event.CreditEventPublisher;
 import com.nttdata.mscredit.exception.BusinessException;
 import com.nttdata.mscredit.model.CreditCard;
 import com.nttdata.mscredit.model.CreditCardStatus;
@@ -22,15 +24,18 @@ import io.reactivex.rxjava3.core.Completable;
 import io.reactivex.rxjava3.core.Flowable;
 import io.reactivex.rxjava3.core.Single;
 import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
 
 @Service
 @RequiredArgsConstructor
+@Slf4j
 public class CreditCardService {
 
     private final CreditCardRepository repository;
     private final OverdueDebtChecker overdueDebtChecker;
     private final CardLimitProperties limits;
     private final Clock clock;
+    private final CreditEventPublisher events;
     private final SecureRandom random = new SecureRandom();
 
     public Single<CreditCard> issue(String customerId, CustomerType customerType) {
@@ -47,7 +52,9 @@ public class CreditCardService {
                             .createdAt(now)
                             .updatedAt(now)
                             .build();
-                    return ReactiveBridge.toSingle(repository.save(card));
+                    return ReactiveBridge.toSingle(repository.save(card))
+                            .flatMap(saved -> publishCardEvent(saved, CreditCardEvent.EventType.CREATED)
+                                    .andThen(Single.just(saved)));
                 })));
     }
 
@@ -106,8 +113,18 @@ public class CreditCardService {
             }
             card.setStatus(CreditCardStatus.CANCELLED);
             card.setUpdatedAt(Instant.now(clock));
-            return ReactiveBridge.toSingle(repository.save(card)).ignoreElement();
+            return ReactiveBridge.toSingle(repository.save(card))
+                    .ignoreElement()
+                    .andThen(publishCardEvent(card, CreditCardEvent.EventType.CANCELLED));
         });
+    }
+
+    /** Event loss is logged and does not fail the request; the card state is already saved. */
+    private Completable publishCardEvent(CreditCard card, CreditCardEvent.EventType type) {
+        return events.publish(CreditCardEvent.TOPIC, card.getId(), new CreditCardEvent(
+                        CreditCardEvent.SCHEMA_VERSION, card.getId(), card.getCustomerId(), type, Instant.now(clock)))
+                .doOnError(error -> log.warn("Could not publish {} for credit card {}", type, card.getId(), error))
+                .onErrorComplete();
     }
 
     private String maskedNumber() {
